@@ -201,6 +201,7 @@
 		enable-active-high;
 		gpios = <&porta 1 GPIO_ACTIVE_HIGH>;
 		vin-supply = <&vcc5v0_sys>;
+		status = "disabled";
 	};
 
 	i2c11: i2c@11 {
