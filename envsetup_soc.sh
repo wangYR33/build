@@ -1926,3 +1926,124 @@ source "$TOP_DIR/build/alios_functions.sh"
 source "$TOP_DIR/build/pld_backdoor.sh"
 
 print_usage
+function revert_sdcard_package()
+{
+    local SCRIPTS_DIR="${TOP_DIR}/build/scripts/"
+    local tgz_path="${1:?usage: revert_sdcard_package <path_to_xxx.tgz>}"
+    local tgz_name inner_dir out tmp xml_pkg_dir
+
+    tgz_path="$(cd "$(dirname "$tgz_path")" && pwd)/$(basename "$tgz_path")" || return 1
+    tgz_name="$(basename "$tgz_path")" ; tgz_name="${tgz_name%.tgz}"
+    out="$PWD/${tgz_name}_out"
+    tmp="$PWD/.revert_${tgz_name}_tmp"
+    xml_pkg_dir="$(dirname "$tgz_path")"
+
+    [ ! -f "$tgz_path" ] && { echo "not found: $tgz_path" >&2; return 1; }
+
+    rm -rf "$tmp" "$out"
+    mkdir -p "$tmp/package_update" "$out"
+
+    # 解压 tgz，拿 partition32G.xml + fip.bin
+    tar -xzf "$tgz_path" -m -C "$tmp/package_update/"
+    inner_dir=$(ls -d "$tmp/package_update/"*/ 2>/dev/null | head -1)
+    [ -z "$inner_dir" ] && { echo "no inner dir in tgz" >&2; rm -rf "$tmp"; return 1; }
+
+    cp -f "${inner_dir}partition32G.xml" "$out/" 2>/dev/null
+    cp -f "${inner_dir}fip.bin" "$out/" 2>/dev/null
+
+    # 判断分片格式：gzip → revert_package.sh；CIMG → 直接从 package_edge 拷
+    local first_shard=$(ls "${inner_dir}"rootfs.*-of-*.gz 2>/dev/null | head -1)
+    local magic=""
+    [ -n "$first_shard" ] && magic=$(head -c 4 "$first_shard" | xxd -p 2>/dev/null)
+
+    if [ "$magic" = "1f8b0808" ]; then
+        # gzip 分片 — 走 revert_package.sh（sdcard）
+        mkdir -p "$tmp/package_update/update/${tgz_name}"
+        cp -r "$SCRIPTS_DIR/revert_package.sh" "$tmp/package_update/update/${tgz_name}/"
+        cp -r "${inner_dir}"* "$tmp/package_update/update/${tgz_name}/"
+        cd "$tmp/package_update/update/${tgz_name}" || { popd; return 1; }
+        ./revert_package.sh boot data rootfs rootfs_rw recovery
+        cd ../
+        sudo rm -rf ./*.tgz
+        mv "./${tgz_name}/"*.tgz ./
+        sudo rm -rf "./${tgz_name}"
+        shopt -s nullglob
+        for tgz in ./*.tgz; do
+            local pname="${tgz##*/}" ; pname="${pname%.tgz}"
+            mkdir -p "$out/$pname"
+            tar -xzf "$tgz" -C "$out/$pname"
+        done
+        shopt -u nullglob
+    else
+        # CIMG shard: cimg2raw decode -> gunzip -> dd merge -> mount ext4 -> tar (usb/tftp)
+        echo "[revert] CIMG format, decoding shards..."
+        SECTOR_BYTES=512
+        CHUNK_SIZE=200704
+        cd "${inner_dir}"
+        for part in boot data rootfs rootfs_rw recovery; do
+            shopt -s nullglob; shards=(${part}.*-of-*.gz); shopt -u nullglob
+            [ ${#shards[@]} -eq 0 ] && continue
+            total=$(echo "${shards[0]}" | grep -oP "\d+-of-\K\d+" | head -1)
+            echo "  [${part}] ${#shards[@]} shards (total=$total)"
+            ext4_file="$tmp/${part}.ext4"
+            rm -f "$ext4_file"
+            offset=0
+            for i in $(seq 1 $total); do
+                shard="${part}.${i}-of-${total}.gz"
+                [ ! -f "$shard" ] && continue
+                python3 ${SCRIPTS_DIR}/cimg2raw.py "$shard" /dev/stdout 2>/dev/null | gunzip -c 2>/dev/null | dd of="$ext4_file" bs=$SECTOR_BYTES seek=$offset count=$CHUNK_SIZE status=none 2>/dev/null
+                offset=$((offset + CHUNK_SIZE))
+            done
+            mnt="$tmp/mnt_${part}"
+            mkdir -p "$mnt"
+            sudo mount "$ext4_file" "$mnt" 2>/dev/null
+            sudo tar -czf "$out/${part}.tgz" -C "$mnt" . 2>/dev/null
+            sudo umount "$mnt" 2>/dev/null
+            sudo rm -rf "$mnt" "$ext4_file"
+            mkdir -p "$out/$part"
+            tar -xzf "$out/${part}.tgz" -C "$out/$part"
+            rm -f "$out/${part}.tgz"
+        done
+        cd /tmp
+    fi
+
+    rm -rf "$tmp"
+    echo "revert_sdcard_package finished: $out"
+}
+
+function rebuild_sdcard_package()
+{
+    local SCRIPTS_DIR="${TOP_DIR}/build/scripts/"
+    local pkg_dir="${1:?usage: rebuild_sdcard_package <xxx_out_dir> [type]}"
+    local pkg_type="${2:-sdcard}"
+    local partition_xml part
+    local parts=(boot data rootfs rootfs_rw recovery misc)
+
+    pkg_dir="$(cd "$pkg_dir" && pwd)" || return 1
+    partition_xml="$pkg_dir/partition32G.xml"
+    [ ! -f "$partition_xml" ] && { echo "partition32G.xml not found: $pkg_dir" >&2; return 1; }
+
+    pushd "$pkg_dir" || return 1
+    for part in "${parts[@]}"; do
+        if [ -d "$part" ]; then
+            tar -zcf "${part}.tgz" --exclude=sys --exclude=proc --exclude=dev --exclude=run -C "$part" . || { popd; return 1; }
+        fi
+    done
+
+    pushd "$SCRIPTS_DIR" || { popd; return 1; }
+    [ ! -e ./mk_gpt ] && { pushd mk-gpt; make; popd; }
+    ./bm_make_package.sh "$pkg_type" "$partition_xml" "$pkg_dir" || { popd; popd; return 1; }
+    popd || { popd; return 1; }
+
+    [ ! -d "$pkg_dir/$pkg_type" ] && { echo "failed: $pkg_dir/$pkg_type" >&2; popd; return 1; }
+
+    pushd "$pkg_dir/$pkg_type" || { popd; return 1; }
+    cp "$SCRIPTS_DIR/local_update.sh" . 2>/dev/null
+    cp "$SCRIPTS_DIR/ota_update.sh" . 2>/dev/null
+    md5sum * > md5.txt
+    popd || { popd; return 1; }
+
+    tar -zcf "${pkg_type}.tgz" "$pkg_type" || { popd; return 1; }
+    popd || return 1
+    echo "rebuild_sdcard_package finished: $pkg_dir/${pkg_type}.tgz"
+}
