@@ -2026,7 +2026,12 @@ function rebuild_sdcard_package()
     pushd "$pkg_dir" || return 1
     for part in "${parts[@]}"; do
         if [ -d "$part" ]; then
-            tar -zcf "${part}.tgz" --exclude=sys --exclude=proc --exclude=dev --exclude=run -C "$part" . || { popd; return 1; }
+            # --anchored 必须写在 --exclude 之前(GNU tar 按位置生效)。
+            # 不加 anchored 时 --exclude 匹配路径中任意一个分量, 会连带删掉
+            # mnt/dev、usr/include/aarch64-linux-gnu/sys 这类非顶层目录。
+            tar -zcf "${part}.tgz" --anchored \
+                --exclude=./sys --exclude=./proc --exclude=./dev --exclude=./run \
+                -C "$part" . || { popd; return 1; }
         fi
     done
 
